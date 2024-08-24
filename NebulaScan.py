@@ -594,13 +594,194 @@ def randomized_port_order():
             print("Invalid choice. Please try again.")
 
 # Vulnerability Assessment functions
-def cve_database_integration():
-    print("Integrating CVE Database...")
-    # Implement CVE database integration logic here
+def update_cve_database():
+    print("Updating CVE database...")
+    nvd_url = "https://nvd.nist.gov/feeds/json/cve/1.1/nvdcve-1.1-recent.json.gz"
+    
+    try:
+        response = requests.get(nvd_url)
+        response.raise_for_status()
+        
+        json_content = gzip.decompress(response.content)
+        cve_data = json.loads(json_content)
+        
+        conn = sqlite3.connect(CVE_DB_PATH)
+        cursor = conn.cursor()
+        
+        cursor.execute('''CREATE TABLE IF NOT EXISTS cve_entries
+                          (id TEXT PRIMARY KEY, description TEXT, cvss_score REAL, 
+                           affected_products TEXT, last_modified_date TEXT)''')
+        
+        for item in cve_data['CVE_Items']:
+            cve_id = item['cve']['CVE_data_meta']['ID']
+            description = item['cve']['description']['description_data'][0]['value']
+            cvss_score = item['impact']['baseMetricV2']['cvssV2']['baseScore'] if 'impact' in item else None
+            affected_products = json.dumps([prod['product']['product_data'][0]['product_name'] 
+                                            for prod in item['cve']['affects']['vendor']['vendor_data']])
+            last_modified_date = item['lastModifiedDate']
+            
+            cursor.execute('''INSERT OR REPLACE INTO cve_entries 
+                              (id, description, cvss_score, affected_products, last_modified_date) 
+                              VALUES (?, ?, ?, ?, ?)''', 
+                           (cve_id, description, cvss_score, affected_products, last_modified_date))
+        
+        conn.commit()
+        conn.close()
+        
+        print("CVE database updated successfully.")
+    except Exception as e:
+        print(f"Error updating CVE database: {e}")
 
-def vulnerability_severity_scoring():
-    print("Scoring Vulnerability Severity...")
-    # Implement vulnerability severity scoring logic here
+def view_database_status():
+    if not os.path.exists(CVE_DB_PATH):
+        print("CVE database has not been created yet.")
+        return
+    
+    conn = sqlite3.connect(CVE_DB_PATH)
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT COUNT(*) FROM cve_entries")
+    total_entries = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT MAX(last_modified_date) FROM cve_entries")
+    last_update = cursor.fetchone()[0]
+    
+    conn.close()
+    
+    print(f"\nCVE Database Status:")
+    print(f"Total entries: {total_entries}")
+    print(f"Last updated: {last_update}")
+
+def search_vulnerabilities(search_term):
+    conn = sqlite3.connect(CVE_DB_PATH)
+    cursor = conn.cursor()
+    
+    cursor.execute('''SELECT * FROM cve_entries 
+                      WHERE id LIKE ? OR description LIKE ? OR affected_products LIKE ?''', 
+                   (f'%{search_term}%', f'%{search_term}%', f'%{search_term}%'))
+    
+    results = cursor.fetchall()
+    
+    conn.close()
+    
+    if results:
+        print(f"\nFound {len(results)} matching vulnerabilities:")
+        for result in results:
+            print(f"\nCVE ID: {result[0]}")
+            print(f"Description: {result[1]}")
+            print(f"CVSS Score: {result[2]}")
+            print(f"Affected Products: {result[3]}")
+            print(f"Last Modified: {result[4]}")
+    else:
+        print("No matching vulnerabilities found.")
+
+def cve_database_integration():
+    while True:
+        print("\nCVE Database Integration")
+        print("------------------------")
+        print("1. Update CVE Database")
+        print("2. View Database Status")
+        print("3. Search Vulnerabilities")
+        print("0. Back to Vulnerability Menu")
+
+        choice = input("Enter your choice: ")
+
+        if choice == '1':
+            update_cve_database()
+        elif choice == '2':
+            view_database_status()
+        elif choice == '3':
+            search_term = input("Enter a product name or CVE ID to search for: ")
+            search_vulnerabilities(search_term)
+        elif choice == '0':
+            break
+        else:
+            print("Invalid choice. Please try again.")
+
+def vulnerability_severity_scoring(cvss_score, cvss_vector=None):
+    def parse_cvss_vector(vector):
+        if not vector:
+            return {}
+        return dict(item.split(":") for item in vector.split("/")[1:])
+
+    def get_severity_category(score):
+        if score is None:
+            return "Unknown"
+        elif score >= 9.0:
+            return "Critical"
+        elif score >= 7.0:
+            return "High"
+        elif score >= 4.0:
+            return "Medium"
+        elif score >= 0.1:
+            return "Low"
+        else:
+            return "None"
+
+    def get_exploitability_subscore(vector_data):
+        weights = {
+            'AV': {'N': 0.85, 'A': 0.62, 'L': 0.55, 'P': 0.2},
+            'AC': {'L': 0.77, 'H': 0.44},
+            'PR': {'N': 0.85, 'L': 0.62, 'H': 0.27},
+            'UI': {'N': 0.85, 'R': 0.62}
+        }
+        
+        exploitability = 8.22
+        for metric in ['AV', 'AC', 'PR', 'UI']:
+            if metric in vector_data:
+                exploitability *= weights[metric].get(vector_data[metric], 1)
+        
+        return round(exploitability, 1)
+
+    def get_impact_subscore(vector_data):
+        weights = {
+            'C': {'H': 0.56, 'L': 0.22, 'N': 0},
+            'I': {'H': 0.56, 'L': 0.22, 'N': 0},
+            'A': {'H': 0.56, 'L': 0.22, 'N': 0}
+        }
+        
+        impact = 0
+        for metric in ['C', 'I', 'A']:
+            if metric in vector_data:
+                impact += weights[metric].get(vector_data[metric], 0)
+        
+        impact_score = 6.42 * impact
+        return round(impact_score, 1)
+
+    vector_data = parse_cvss_vector(cvss_vector)
+    severity_category = get_severity_category(cvss_score)
+    
+    result = {
+        "CVSS Score": cvss_score,
+        "Severity": severity_category,
+        "Vector String": cvss_vector
+    }
+
+    if vector_data:
+        result["Exploitability Subscore"] = get_exploitability_subscore(vector_data)
+        result["Impact Subscore"] = get_impact_subscore(vector_data)
+        result["Attack Vector"] = vector_data.get('AV', 'Unknown')
+        result["Attack Complexity"] = vector_data.get('AC', 'Unknown')
+        result["Privileges Required"] = vector_data.get('PR', 'Unknown')
+        result["User Interaction"] = vector_data.get('UI', 'Unknown')
+        result["Scope"] = vector_data.get('S', 'Unknown')
+        result["Confidentiality Impact"] = vector_data.get('C', 'Unknown')
+        result["Integrity Impact"] = vector_data.get('I', 'Unknown')
+        result["Availability Impact"] = vector_data.get('A', 'Unknown')
+
+    return result
+
+# Example usage:
+if __name__ == "__main__":
+    # Example CVSS score and vector
+    cvss_score = 7.5
+    cvss_vector = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+    
+    result = vulnerability_severity_scoring(cvss_score, cvss_vector)
+    
+    print("Vulnerability Severity Assessment:")
+    for key, value in result.items():
+        print(f"{key}: {value}")
 
 def exploitability_checks():
     print("Checking Exploitability...")
